@@ -1,7 +1,7 @@
 package server
 
 import (
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +22,10 @@ import (
 var (
 	MAX_SIZE uint64
 
-	TIMEOUT = 600 * time.Second
+	CONNECT_TIMEOUT    = 30 * time.Second   // 连接超时
+	HEADER_TIMEOUT     = 60 * time.Second   // 响应头超时
+	LARGE_FILE_TIMEOUT = 1800 * time.Second // 大文件传输超时 (30分钟)
+	NORMAL_TIMEOUT     = 600 * time.Second  // 普通请求超时
 )
 
 var (
@@ -49,8 +52,18 @@ var (
 
 	env = logger.GetEnv()
 
-	client = &http.Client{
-		Timeout: TIMEOUT,
+	// 配置传输层
+	transport = &http.Transport{
+		Dial: (&net.Dialer{
+			Timeout:   CONNECT_TIMEOUT,
+			KeepAlive: 30 * time.Second,
+		}).Dial,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   CONNECT_TIMEOUT,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: HEADER_TIMEOUT, // 只对响应头设置较短超时
 	}
 )
 
@@ -74,45 +87,6 @@ type ErrorResponse struct {
 
 func newErrorResponse(err error) ErrorResponse {
 	return ErrorResponse{err.Error()}
-}
-
-func dialTimeout(network, addr string) (net.Conn, error) {
-	return net.DialTimeout(network, addr, TIMEOUT)
-}
-
-var transport = http.Transport{
-	Dial:                dialTimeout,
-	MaxIdleConns:        100,
-	MaxIdleConnsPerHost: 100,
-}
-
-func disableRedirect(req *http.Request, via []*http.Request) error {
-	return http.ErrUseLastResponse
-}
-
-func newBody(body []byte) io.ReadCloser {
-	if body == nil {
-		return nil
-	}
-
-	bodyBuffer := bytes.NewBuffer(body)
-	return io.NopCloser(bodyBuffer)
-}
-
-func convertHeader(src http.Header) http.Header {
-	if src == nil {
-		return nil
-	}
-
-	header := make(http.Header)
-
-	for key, value := range src {
-		if key != "Host" {
-			header[key] = value
-		}
-	}
-
-	return header
 }
 
 func checkURL(u string) bool {
@@ -197,17 +171,6 @@ func handleResponseError(c *gin.Context, err error) error {
 	return err
 }
 
-func newRequest(method, url string, header http.Header, body io.ReadCloser) (*http.Request, error) {
-	req, error := http.NewRequest(method, url, body)
-	if error != nil {
-		return nil, error
-	}
-
-	req.Header = convertHeader(header)
-
-	return req, nil
-}
-
 func handleInvalidResponse(c *gin.Context, resp *http.Response) error {
 	c.Status(resp.StatusCode)
 
@@ -229,19 +192,63 @@ func handleInvalidResponse(c *gin.Context, resp *http.Response) error {
 }
 
 func proxy(c *gin.Context, u string, followRedirect bool) error {
-	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodPost {
+	if err := handleMethod(u, c.Request.Method); err != nil {
 		return ErrMethod
 	}
 
-	c.Request.Header.Del("Host")
+	// 先发送HEAD请求获取Content-Length来判断是否是大文件
+	isLargeFile := false
+	headClient := &http.Client{
+		Transport: transport,
+		Timeout:   HEADER_TIMEOUT, // 只对头部获取设置较短超时
+	}
 
-	req, err := newRequest(c.Request.Method, u, c.Request.Header, c.Request.Body)
+	headReq, err := http.NewRequest("HEAD", u, nil)
+	if err == nil {
+		headReq.Header = make(http.Header)
+		// 复制必要的头部（排除Host）
+		for key, values := range c.Request.Header {
+			if key != "Host" {
+				headReq.Header[key] = values
+			}
+		}
+
+		headResp, headErr := headClient.Do(headReq)
+		if headErr == nil {
+			defer headResp.Body.Close()
+			if headResp.ContentLength > 0 && uint64(headResp.ContentLength) > MAX_SIZE/10 {
+				isLargeFile = true
+			}
+		}
+	}
+
+	// 根据文件大小选择超时时间
+	requestTimeout := NORMAL_TIMEOUT
+	if isLargeFile {
+		requestTimeout = LARGE_FILE_TIMEOUT
+	}
+
+	// 创建带超时的上下文
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	// 创建请求
+	req, err := http.NewRequestWithContext(ctx, c.Request.Method, u, c.Request.Body)
 	if err != nil {
 		return err
 	}
 
+	// 复制请求头（排除Host）
+	for key, values := range c.Request.Header {
+		if key != "Host" {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+	}
+
 	if env == "dev" {
-		fields := make(map[string]interface{})
+		fields := make(map[string]any)
 		for k, v := range req.Header {
 			fields[k] = v
 		}
@@ -251,8 +258,20 @@ func proxy(c *gin.Context, u string, followRedirect bool) error {
 			Msg("Request info")
 	}
 
+	// 创建客户端，不设置总的超时，依赖上下文超时
+	client := &http.Client{
+		Transport: transport,
+		// 不设置Timeout，使用上下文控制
+	}
+
+	// 设置重定向策略
 	if !followRedirect {
-		client.CheckRedirect = disableRedirect
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	} else {
+		// 恢复默认重定向策略
+		client.CheckRedirect = nil
 	}
 
 	log.Trace().Msg("Sending request")
@@ -263,7 +282,7 @@ func proxy(c *gin.Context, u string, followRedirect bool) error {
 	}
 
 	if env == "dev" {
-		fields := make(map[string]interface{})
+		fields := make(map[string]any)
 		for k, v := range resp.Header {
 			fields[k] = v
 		}
@@ -278,7 +297,6 @@ func proxy(c *gin.Context, u string, followRedirect bool) error {
 		ua := req.Header.Get("User-Agent")
 		if env == "dev" || (len(ua) > 3 && ua[:3] == "git") {
 			handleResponse(c, resp)
-
 			return nil
 		}
 
@@ -288,14 +306,12 @@ func proxy(c *gin.Context, u string, followRedirect bool) error {
 		if checkURL(location) {
 			c.Status(http.StatusFound)
 			c.Header("Location", "/"+resp.Header.Get("Location"))
-
 			return nil
 		}
 
 		return proxy(c, location, true)
 	case http.StatusNotModified:
 		c.Status(resp.StatusCode)
-
 		return nil
 	default:
 		return handleInvalidResponse(c, resp)
@@ -310,7 +326,6 @@ func handler(c *gin.Context) {
 	// 防止有人访问不存在文件，如 <HOST>/.env，长度小于等于 4 时会 panic
 	if len(u) <= 4 {
 		c.Status(http.StatusNotFound)
-
 		return
 	}
 
@@ -323,7 +338,6 @@ func handler(c *gin.Context) {
 	u, err := url.QueryUnescape(u)
 	if err != nil {
 		c.Status(http.StatusBadRequest)
-
 		return
 	}
 
@@ -348,12 +362,6 @@ func handler(c *gin.Context) {
 	if err != nil {
 		return
 	}
-
-	return
-}
-
-func index(c *gin.Context) {
-	c.HTML(http.StatusOK, "./static/index.html", nil)
 }
 
 func Run(staticDir, host string, port, max_size uint) {
